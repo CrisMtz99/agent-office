@@ -6,6 +6,7 @@ import { agentRoutes } from './agents.js';
 import { authRoutes } from './auth.js';
 import { fileRoutes } from './files.js';
 import { githubRoutes } from './github.js';
+import { osDoorRoutes } from './os-door.js';
 import { pageRoutes } from './pages.js';
 import { searchRoutes } from './search.js';
 import { serviceRoutes } from './services.js';
@@ -25,6 +26,8 @@ export const routes: readonly Route[] = [
   pageRoutes.claim,
   pageRoutes.join,
   pageRoutes.favicon,
+  // Its own bearer token and loopback check, not a session (see os-door/).
+  osDoorRoutes.door,
   // Signed in.
   authRoutes.whoami,
   agentRoutes.models,

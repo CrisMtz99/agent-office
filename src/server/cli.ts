@@ -18,6 +18,10 @@ if (argv[0] === 'setup') {
   const { setupCommand } = await import('./setup.js');
   process.exit(await setupCommand(argv.slice(1)));
 }
+if (argv[0] === 'os-door') {
+  const { osDoorCommand } = await import('./os-door/token.js');
+  process.exit(osDoorCommand(argv.slice(1)));
+}
 if (argv[0] === 'tunnel') {
   const { tunnelCommand } = await import('./tunnel/index.js');
   process.exit(await tunnelCommand(argv.slice(1)));
@@ -39,6 +43,9 @@ try {
   else console.error(`agent-office: ${e.message}`);
   process.exit(1);
 }
+
+// The OS door's token is there from the first start, for a command center to read (docs/os-door.md).
+(await import('./os-door/token.js')).ensureOsDoorToken(cfg.dataDir);
 
 const scheme = cfg.tls ? 'https' : 'http';
 const everywhere = cfg.host === '0.0.0.0' || cfg.host === '::';
