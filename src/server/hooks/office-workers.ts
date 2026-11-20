@@ -1,6 +1,6 @@
 import type http from 'node:http';
 import { notLeaving } from '../leave-on-merge.js';
-import { findWorker, readHireRequest, readHomeRequest, readPrRequest, workerRow, type PullsView } from '../office-workers.js';
+import { findWorker, readHireRequest, readHomeRequest, readPrRequest, workerRow, type HireRequest, type PullsView } from '../office-workers.js';
 import { gh } from '../github.js';
 import type { Floor } from '../floor.js';
 import { nextFreeSeat } from '../../shared/layout.js';
@@ -45,7 +45,7 @@ export async function officeWorkers(ctx: Ctx, req: http.IncomingMessage, res: ht
   const me = floor?.workers.authenticate(workerId, token);
   if (!floor || !me) return send(res, 401, { error: 'Send your own AGENT_OFFICE_WORKER_ID as ?worker= and AGENT_OFFICE_HOOK_TOKEN as the bearer token' });
   const who = me.name;
-  const view: PullsView = { pulls: floor.github.pulls.items, tasks: floor.queue.state().tasks, pullsOf: (id) => ctx.floors.get(id)?.github.pulls.items };
+  const view = pullsView(ctx, floor);
   const row = (id: string) => {
     const w = floor.workers.get(id);
     return w && workerRow(w, view, me.id);
@@ -116,13 +116,7 @@ export async function officeWorkers(ctx: Ctx, req: http.IncomingMessage, res: ht
     const w = findWorker(floor.workers.list(), str(b.worker, 64));
     if (typeof w === 'string') return send(res, 404, { error: w });
     if (w.id === me.id) return send(res, 400, { error: "That's you" });
-    // A shell would run it as a command, in someone's terminal.
-    if (w.kind !== 'agent') return send(res, 400, { error: `${w.name} is a shell, not an agent` });
-    const text = str(b.prompt, 20000).replace(/\r\n?/g, '\n').trim();
-    if (!text) return send(res, 400, { error: 'Say what to tell it: prompt' });
-    let err = floor.workers.prompt(w.id, text, who);
-    // Stopped or asleep: it wakes up with this as its next message.
-    if (err === 'Worker is not running') err = floor.workers.resume(w.id, text);
+    const err = tellWorker(floor, w, str(b.prompt, 20000), who);
     if (err) return send(res, 400, { error: err });
     return send(res, 200, { ok: true, worker: row(w.id) });
   }
@@ -144,18 +138,33 @@ export async function officeWorkers(ctx: Ctx, req: http.IncomingMessage, res: ht
 
   const ask = readHireRequest(body, floor.project.agentProviders);
   if (typeof ask === 'string') return send(res, 400, { error: ask });
+  // It runs as whoever the asking worker runs as.
+  const hired = await hireWorker(ctx, floor, ask, who, floor.workers.ownerOf(me.id));
+  if ('error' in hired) return send(res, hired.status, { error: hired.error });
+  send(res, 200, { ok: true, worker: row(hired.worker.id) });
+}
+
+/** What `floor` knows about its workers' pull requests, for workerRow. */
+export function pullsView(ctx: Ctx, floor: Floor): PullsView {
+  return { pulls: floor.github.pulls.items, tasks: floor.queue.state().tasks, pullsOf: (id) => ctx.floors.get(id)?.github.pulls.items };
+}
+
+/**
+ * Hires a worker on `floor` for `who`, with its task (the /office/workers hire, and the OS door's,
+ * os-door/): the desk asked or the next free one, its worktree from what's on GitHub now, and the
+ * issue, if any, taken off the queue and assigned. The floor hears who hired whom.
+ */
+export async function hireWorker(ctx: Ctx, floor: Floor, ask: HireRequest, who: string, owner?: string): Promise<{ worker: WorkerInfo } | { status: number; error: string }> {
   const desk = ask.desk ?? nextFreeSeat((id) => floor.workers.deskOccupied(id), floor.plan.wing)?.id;
-  if (!desk) return send(res, 409, { error: 'Every desk and bean bag is taken: send someone home first' });
+  if (!desk) return { status: 409, error: 'Every desk and bean bag is taken: send someone home first' };
   // A model or effort is the office's default worker's unless it says whose.
   const provider = ask.provider ?? (ask.model || ask.effort ? floor.workers.officeDefault.provider : undefined);
   const worktree = ask.worktree ?? !!floor.project.branch;
   // Its worktree starts from what's on GitHub now, like one hired from a desk.
   if (worktree) await floor.workers.fetchBase();
-  if (!ctx.floors.has(floor.id)) return send(res, 410, { error: 'This floor closed' });
-  // It runs as whoever the asking worker runs as.
-  const owner = floor.workers.ownerOf(me.id);
+  if (!ctx.floors.has(floor.id)) return { status: 410, error: 'This floor closed' };
   const r = floor.workers.spawn(desk, who, ask.prompt, worktree, 'agent', provider, ask.model, ask.effort, undefined, owner);
-  if (typeof r === 'string') return send(res, 400, { error: r });
+  if (typeof r === 'string') return { status: 400, error: r };
   ctx.toastFloor(floor, `${who} hired ${r.name}${ask.issue ? ` for issue #${ask.issue}` : ' with a task'}`);
   if (ask.issue) {
     const n = ask.issue;
@@ -164,5 +173,19 @@ export async function officeWorkers(ctx: Ctx, req: http.IncomingMessage, res: ht
     if (typeof as === 'string') ctx.toastFloor(floor, `Couldn't assign issue #${n} on GitHub: ${as}`, 'warn');
     else void floor.github.claim(n, as).then((e) => e && ctx.toastFloor(floor, `Couldn't assign issue #${n} on GitHub: ${e}`, 'warn'));
   }
-  send(res, 200, { ok: true, worker: row(r.id) });
+  return { worker: r };
+}
+
+/**
+ * Types `text` to worker `w` as `who` (the /office/workers tell, and the OS door's message): a
+ * stopped or asleep one wakes up with it as its next message. A string says why it couldn't.
+ */
+export function tellWorker(floor: Floor, w: WorkerInfo, text: string, who: string): string | undefined {
+  // A shell would run it as a command, in someone's terminal.
+  if (w.kind !== 'agent') return `${w.name} is a shell, not an agent`;
+  const clean = text.replace(/\r\n?/g, '\n').trim();
+  if (!clean) return 'Say what to tell it: prompt';
+  const err = floor.workers.prompt(w.id, clean, who);
+  // Stopped or asleep: it wakes up with this as its next message.
+  return err === 'Worker is not running' ? floor.workers.resume(w.id, clean) : err;
 }
